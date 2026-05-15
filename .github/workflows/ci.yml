@@ -1,4 +1,4 @@
-name: ci
+name: beam
 
 on:
   pull_request:
