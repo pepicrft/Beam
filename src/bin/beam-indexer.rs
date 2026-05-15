@@ -6,8 +6,11 @@ use beam::indexer::{
 use clap::{Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::{path::PathBuf, time::Instant};
-use tokio::{fs, io, runtime::Handle};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use tokio::{fs, io, runtime::Handle, time::sleep};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -218,8 +221,7 @@ async fn bench_command(
     handle.shutdown().await?;
 
     let cold_start_begin = Instant::now();
-    let reopened = FileIndexHandle::spawn(config, Handle::current())?;
-    let cold_snapshot = reopened.snapshot().await?;
+    let (reopened, cold_snapshot) = reopen_for_benchmark(config).await?;
     let cold_start_ms = cold_start_begin.elapsed().as_secs_f64() * 1_000.0;
     reopened.shutdown().await?;
 
@@ -227,6 +229,7 @@ async fn bench_command(
         beam: BenchmarkMetrics {
             full_refresh_ms: refresh_duration_ms,
             cold_start_ms,
+            throughput: ThroughputMetrics::new(&refreshed.stats, refresh_duration_ms),
             stats: refreshed.stats,
             storage: refreshed.storage,
         },
@@ -239,12 +242,12 @@ async fn bench_command(
         println!("{}", serde_json::to_string_pretty(&benchmark)?);
     } else {
         println!(
-            "Beam full refresh: {:.2} ms, cold start: {:.2} ms, entries: {}",
+            "Beam full refresh: {:.2} ms, cold start: {:.2} ms, entries: {}, {:.6} ms/entry, {:.0} entries/s",
             benchmark.beam.full_refresh_ms,
             benchmark.beam.cold_start_ms,
-            benchmark.beam.stats.indexed_files
-                + benchmark.beam.stats.indexed_directories
-                + benchmark.beam.stats.indexed_symlinks
+            benchmark.beam.throughput.entries,
+            benchmark.beam.throughput.ms_per_entry,
+            benchmark.beam.throughput.entries_per_second,
         );
         if let Some(search) = &benchmark.search {
             println!(
@@ -254,8 +257,17 @@ async fn bench_command(
         }
         if let Some(raycast) = &benchmark.raycast {
             println!(
-                "Raycast recorded full index duration: {:.2} ms for {} entries",
-                raycast.full_refresh_ms, raycast.entries
+                "Raycast recorded full index duration: {:.2} ms for {} entries, {:.6} ms/entry, {:.0} entries/s",
+                raycast.full_refresh_ms,
+                raycast.throughput.entries,
+                raycast.throughput.ms_per_entry,
+                raycast.throughput.entries_per_second,
+            );
+            println!(
+                "Beam vs Raycast throughput: {:.2}x entries/s, {:.2}x ms/entry",
+                benchmark.beam.throughput.entries_per_second
+                    / raycast.throughput.entries_per_second,
+                benchmark.beam.throughput.ms_per_entry / raycast.throughput.ms_per_entry,
             );
         }
     }
@@ -309,8 +321,39 @@ struct BenchmarkResult {
 struct BenchmarkMetrics {
     full_refresh_ms: f64,
     cold_start_ms: f64,
+    throughput: ThroughputMetrics,
     stats: IndexStats,
     storage: IndexStorageConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct ThroughputMetrics {
+    entries: u64,
+    ms_per_entry: f64,
+    entries_per_second: f64,
+}
+
+impl ThroughputMetrics {
+    fn new(stats: &IndexStats, duration_ms: f64) -> Self {
+        let entries = total_entries(stats);
+        let entries_f64 = entries as f64;
+        let ms_per_entry = if entries == 0 {
+            0.0
+        } else {
+            duration_ms / entries_f64
+        };
+        let entries_per_second = if duration_ms == 0.0 {
+            0.0
+        } else {
+            entries_f64 / (duration_ms / 1_000.0)
+        };
+
+        Self {
+            entries,
+            ms_per_entry,
+            entries_per_second,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -327,6 +370,7 @@ struct RaycastBaseline {
     files: u64,
     directories: u64,
     symlinks: u64,
+    throughput: ThroughputMetrics,
 }
 
 async fn read_raycast_baseline() -> Result<Option<RaycastBaseline>> {
@@ -340,13 +384,62 @@ async fn read_raycast_baseline() -> Result<Option<RaycastBaseline>> {
         Err(error) => return Err(error.into()),
     };
     let stats: serde_json::Value = serde_json::from_str(&contents)?;
+    let files = stats["num_files"].as_u64().unwrap_or_default();
+    let directories = stats["num_directories"].as_u64().unwrap_or_default();
+    let symlinks = stats["num_symlinks"].as_u64().unwrap_or_default();
+    let entries = stats["num_entries"]
+        .as_u64()
+        .unwrap_or_else(|| files + directories + symlinks);
+    let full_refresh_ms = stats["duration"].as_f64().unwrap_or_default() * 1_000.0;
     Ok(Some(RaycastBaseline {
-        full_refresh_ms: stats["duration"].as_f64().unwrap_or_default() * 1_000.0,
-        entries: stats["num_entries"].as_u64().unwrap_or_default(),
-        files: stats["num_files"].as_u64().unwrap_or_default(),
-        directories: stats["num_directories"].as_u64().unwrap_or_default(),
-        symlinks: stats["num_symlinks"].as_u64().unwrap_or_default(),
+        full_refresh_ms,
+        entries,
+        files,
+        directories,
+        symlinks,
+        throughput: ThroughputMetrics {
+            entries,
+            ms_per_entry: if entries == 0 {
+                0.0
+            } else {
+                full_refresh_ms / entries as f64
+            },
+            entries_per_second: if full_refresh_ms == 0.0 {
+                0.0
+            } else {
+                entries as f64 / (full_refresh_ms / 1_000.0)
+            },
+        },
     }))
+}
+
+async fn reopen_for_benchmark(
+    config: IndexConfig,
+) -> Result<(FileIndexHandle, beam::indexer::IndexSnapshot)> {
+    const RETRIES: usize = 8;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut last_error = None;
+    for attempt in 0..RETRIES {
+        let handle = FileIndexHandle::spawn(config.clone(), Handle::current())?;
+        match handle.snapshot().await {
+            Ok(snapshot) => return Ok((handle, snapshot)),
+            Err(error) if error.to_string().contains("indexer actor dropped") => {
+                last_error = Some(error);
+                if attempt + 1 < RETRIES {
+                    sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to reopen benchmark indexer")))
+}
+
+fn total_entries(stats: &IndexStats) -> u64 {
+    stats.indexed_files + stats.indexed_directories + stats.indexed_symlinks
 }
 
 fn init_tracing() {
