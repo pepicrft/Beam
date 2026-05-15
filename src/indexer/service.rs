@@ -152,6 +152,7 @@ impl IndexActor {
             .expect("normalized config must contain storage")
             .clone();
         let roots = config.roots.clone();
+        let watch_enabled = config.watch;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
@@ -164,7 +165,11 @@ impl IndexActor {
             event_rx,
             completion_rx,
             completion_tx,
-            watchers: install_watchers(&roots, &event_tx),
+            watchers: if watch_enabled {
+                install_watchers(&roots, &event_tx)
+            } else {
+                Vec::new()
+            },
             backend: None,
             pending_operations: VecDeque::new(),
             current_operation: None,
@@ -253,7 +258,9 @@ impl IndexActor {
         store_queue(&self.paths, &PersistedQueueState::empty(&self.paths)).await?;
 
         self.publish(IndexUpdateKind::Loaded);
-        self.enqueue_full(false).await;
+        if self.config.refresh_on_start {
+            self.enqueue_full(false).await;
+        }
         Ok(())
     }
 

@@ -170,7 +170,7 @@ where
             .await
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let payload = serde_json::to_vec_pretty(value)?;
+    let payload = serde_json::to_vec(value)?;
     fs::write(path, payload)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;

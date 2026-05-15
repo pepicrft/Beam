@@ -90,11 +90,10 @@ async fn scan_directory_subtree(
     matcher: Arc<GlobSet>,
 ) -> Result<ScanOutcome> {
     let mut outcome = ScanOutcome::default();
-    let root_matchers = load_ignore_matchers(&subtree).await?;
     let mut queue = VecDeque::from([DirectoryJob {
         root,
         directory: subtree,
-        ignore_matchers: root_matchers,
+        ignore_matchers: Vec::new(),
     }]);
     let mut join_set = JoinSet::new();
 
@@ -131,25 +130,53 @@ struct DirectoryScan {
     child_directories: Vec<DirectoryJob>,
 }
 
+struct DirectoryEntryRecord {
+    path: PathBuf,
+    metadata: Metadata,
+}
+
 async fn scan_directory(
     job: DirectoryJob,
     matcher: Arc<GlobSet>,
     config: &IndexConfig,
 ) -> Result<DirectoryScan> {
-    let local_ignore_matchers = load_ignore_matchers(&job.directory).await?;
+    let mut reader = match fs::read_dir(&job.directory).await {
+        Ok(reader) => reader,
+        Err(error) if should_skip_io_error(&error) => {
+            return Ok(DirectoryScan {
+                documents: HashMap::new(),
+                child_directories: Vec::new(),
+            });
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", job.directory.display()));
+        }
+    };
+    let mut entries = Vec::new();
+
+    while let Some(dir_entry) = match reader.next_entry().await {
+        Ok(entry) => entry,
+        Err(error) if should_skip_io_error(&error) => None,
+        Err(error) => return Err(error.into()),
+    } {
+        let path = dir_entry.path();
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if should_skip_io_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        entries.push(DirectoryEntryRecord { path, metadata });
+    }
+
+    let local_ignore_matchers = load_ignore_matchers(&job.directory, &entries).await?;
     let mut active_matchers = job.ignore_matchers.clone();
     active_matchers.extend(local_ignore_matchers);
-
-    let mut reader = fs::read_dir(&job.directory)
-        .await
-        .with_context(|| format!("failed to read {}", job.directory.display()))?;
     let mut documents = HashMap::new();
     let mut child_directories = Vec::new();
 
-    while let Some(dir_entry) = reader.next_entry().await? {
-        let path = dir_entry.path();
-        let metadata = fs::symlink_metadata(&path).await?;
-
+    for entry in entries {
+        let DirectoryEntryRecord { path, metadata } = entry;
         if should_skip(
             &job.root,
             &path,
@@ -193,7 +220,7 @@ async fn load_existing_document(
 ) -> Result<Option<ScannedDocument>> {
     let metadata = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if should_skip_io_error(&error) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
 
@@ -301,22 +328,36 @@ fn build_exclusions(config: &IndexConfig) -> Result<GlobSet> {
     builder.build().context("failed to build exclusion matcher")
 }
 
-async fn load_ignore_matchers(directory: &Path) -> Result<Vec<Arc<Gitignore>>> {
+async fn load_ignore_matchers(
+    directory: &Path,
+    entries: &[DirectoryEntryRecord],
+) -> Result<Vec<Arc<Gitignore>>> {
     let mut matchers = Vec::new();
-    for file_name in IGNORE_FILE_NAMES {
-        let path = directory.join(file_name);
-        let contents = match fs::read_to_string(&path).await {
+    for entry in entries {
+        if !entry.metadata.is_file() {
+            continue;
+        }
+        let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !IGNORE_FILE_NAMES.contains(&name) {
+            continue;
+        }
+        let contents = match fs::read_to_string(&entry.path).await {
             Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if should_skip_io_error(&error) => continue,
             Err(error) => return Err(error.into()),
         };
         let mut builder = GitignoreBuilder::new(directory);
         for line in contents.lines() {
-            builder.add_line(Some(path.clone()), line)?;
+            builder.add_line(Some(entry.path.clone()), line)?;
         }
-        let matcher = builder
-            .build()
-            .with_context(|| format!("failed to build ignore matcher for {}", path.display()))?;
+        let matcher = builder.build().with_context(|| {
+            format!(
+                "failed to build ignore matcher for {}",
+                entry.path.display()
+            )
+        })?;
         matchers.push(Arc::new(matcher));
     }
     Ok(matchers)
@@ -431,6 +472,15 @@ fn windows_hidden(_metadata: &Metadata) -> bool {
     false
 }
 
+fn should_skip_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ScanTarget, scan_full, scan_targets};
@@ -511,6 +561,36 @@ mod tests {
             .get(&root.join("notes.md"))
             .expect("file should be indexed");
         assert_eq!(scanned.content.as_deref(), Some("beam launcher"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_exclusions_skip_app_support_and_bundles() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join("Library/Application Support/MyApp")).await?;
+        fs::create_dir_all(root.join("Editor.xcodeproj/project.xcworkspace")).await?;
+        fs::write(
+            root.join("Library/Application Support/MyApp/cache.db"),
+            "ignored",
+        )
+        .await?;
+        fs::write(root.join("Editor.xcodeproj/project.pbxproj"), "ignored").await?;
+        fs::write(root.join("notes.md"), "kept").await?;
+
+        let outcome = scan_full(&test_config(root)).await?;
+
+        assert!(outcome.documents.contains_key(&root.join("notes.md")));
+        assert!(
+            !outcome
+                .documents
+                .contains_key(&root.join("Library/Application Support/MyApp/cache.db"))
+        );
+        assert!(
+            !outcome
+                .documents
+                .contains_key(&root.join("Editor.xcodeproj/project.pbxproj"))
+        );
         Ok(())
     }
 }
