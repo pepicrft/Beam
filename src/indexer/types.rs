@@ -1,6 +1,43 @@
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{cmp, path::PathBuf, thread};
+
+const PROJECT_QUALIFIER: &str = "com";
+const PROJECT_ORGANIZATION: &str = "beam";
+const PROJECT_APPLICATION: &str = "Beam";
+const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 128 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexStorageConfig {
+    pub data_dir: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl IndexStorageConfig {
+    pub fn new(data_dir: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            state_dir,
+        }
+    }
+
+    pub fn project_default() -> Result<Self> {
+        let project_dirs =
+            ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORGANIZATION, PROJECT_APPLICATION)
+                .ok_or_else(|| anyhow!("failed to resolve platform storage directories"))?;
+        let state_dir = project_dirs
+            .state_dir()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| project_dirs.data_local_dir().to_path_buf());
+
+        Ok(Self {
+            data_dir: project_dirs.data_local_dir().to_path_buf(),
+            state_dir,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexConfig {
@@ -9,7 +46,11 @@ pub struct IndexConfig {
     pub ignore_hidden: bool,
     pub follow_symlinks: bool,
     pub watch: bool,
+    pub index_contents: bool,
+    pub respect_ignore_files: bool,
+    pub max_file_size_bytes: u64,
     pub max_concurrency: usize,
+    pub storage: Option<IndexStorageConfig>,
 }
 
 impl Default for IndexConfig {
@@ -25,7 +66,11 @@ impl Default for IndexConfig {
             ignore_hidden: true,
             follow_symlinks: false,
             watch: true,
+            index_contents: false,
+            respect_ignore_files: true,
+            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
             max_concurrency: default_concurrency(),
+            storage: None,
         }
     }
 }
@@ -38,11 +83,26 @@ impl IndexConfig {
         }
     }
 
-    pub fn normalized(mut self) -> Self {
+    pub fn with_storage(mut self, storage: IndexStorageConfig) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn normalized(mut self) -> Result<Self> {
         self.max_concurrency = cmp::max(1, self.max_concurrency);
+        self.max_file_size_bytes = cmp::max(1, self.max_file_size_bytes);
         self.roots.sort();
         self.roots.dedup();
-        self
+        if self.storage.is_none() {
+            self.storage = Some(IndexStorageConfig::project_default()?);
+        }
+        Ok(self)
+    }
+
+    pub fn storage(&self) -> Result<&IndexStorageConfig> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| anyhow!("index config storage has not been normalized"))
     }
 }
 
@@ -73,12 +133,28 @@ pub struct SearchHit {
     pub score: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchBackend {
+    Recommended,
+    Poll,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WatchState {
+    pub backend: WatchBackend,
+    pub roots: Vec<PathBuf>,
+    pub recursive: bool,
+    pub last_event_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexStats {
     pub roots: Vec<PathBuf>,
-    pub indexed_files: usize,
-    pub indexed_directories: usize,
-    pub indexed_symlinks: usize,
+    pub indexed_files: u64,
+    pub indexed_directories: u64,
+    pub indexed_symlinks: u64,
+    pub indexed_bytes: u64,
     pub initial_scan_complete: bool,
     pub currently_scanning: bool,
     pub scan_generation: u64,
@@ -94,6 +170,7 @@ impl IndexStats {
             indexed_files: 0,
             indexed_directories: 0,
             indexed_symlinks: 0,
+            indexed_bytes: 0,
             initial_scan_complete: false,
             currently_scanning: false,
             scan_generation: 0,
@@ -107,17 +184,22 @@ impl IndexStats {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexSnapshot {
     pub stats: IndexStats,
+    pub storage: IndexStorageConfig,
+    pub watch: Option<WatchState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexDump {
     pub stats: IndexStats,
+    pub storage: IndexStorageConfig,
+    pub watch: Option<WatchState>,
     pub entries: Vec<IndexedEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexUpdateKind {
+    Loaded,
     Started,
     Rebuilt,
     Refreshed,
@@ -128,14 +210,19 @@ pub enum IndexUpdateKind {
 pub struct IndexUpdate {
     pub kind: IndexUpdateKind,
     pub stats: IndexStats,
+    pub watch: Option<WatchState>,
 }
 
 pub fn default_index_roots() -> Vec<PathBuf> {
-    dirs::home_dir().into_iter().collect()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
+        .into_iter()
+        .collect()
 }
 
 fn default_concurrency() -> usize {
     thread::available_parallelism()
-        .map(|parallelism| cmp::max(2, parallelism.get() / 2))
+        .map(|parallelism| cmp::max(2, parallelism.get()))
         .unwrap_or(4)
 }

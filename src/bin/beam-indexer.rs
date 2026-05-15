@@ -55,7 +55,8 @@ async fn scan_command(
     json: bool,
 ) -> Result<()> {
     let config = IndexConfig::with_roots(resolve_roots(roots)?);
-    let handle = FileIndexHandle::spawn(config, Handle::current());
+    let handle = FileIndexHandle::spawn(config, Handle::current())?;
+    let snapshot = handle.refresh().await?;
 
     if let Some(query) = query {
         let hits = handle.search(query, limit).await?;
@@ -78,11 +79,12 @@ async fn scan_command(
             );
         } else {
             println!(
-                "Indexed {} files, {} directories, {} symlinks across {} roots.",
-                dump.stats.indexed_files,
-                dump.stats.indexed_directories,
-                dump.stats.indexed_symlinks,
-                dump.stats.roots.len()
+                "Indexed {} files, {} directories, {} symlinks across {} roots in {}.",
+                snapshot.stats.indexed_files,
+                snapshot.stats.indexed_directories,
+                snapshot.stats.indexed_symlinks,
+                snapshot.stats.roots.len(),
+                snapshot.storage.data_dir.display()
             );
             for entry in dump.entries {
                 println!("{}", entry.absolute_path.display());
@@ -96,7 +98,7 @@ async fn scan_command(
 
 async fn serve_command(roots: Vec<std::path::PathBuf>) -> Result<()> {
     let config = IndexConfig::with_roots(resolve_roots(roots)?);
-    let handle = FileIndexHandle::spawn(config, Handle::current());
+    let handle = FileIndexHandle::spawn(config, Handle::current())?;
 
     let mut stdin = FramedRead::new(io::stdin(), LinesCodec::new());
     let mut stdout = FramedWrite::new(io::stdout(), LinesCodec::new());

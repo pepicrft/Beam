@@ -18,7 +18,8 @@ impl BeamWindow {
         let controller = FileIndexHandle::spawn(
             IndexConfig::with_roots(roots.clone()),
             gpui_tokio::Tokio::handle(cx),
-        );
+        )
+        .expect("failed to start indexer");
         let stats = IndexStats::pending(roots);
 
         let controller_for_bootstrap = controller.clone();
