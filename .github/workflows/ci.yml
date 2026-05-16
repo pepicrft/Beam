@@ -1,0 +1,151 @@
+name: beam
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xcrun metal -v >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xcrun metal -v >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xcrun metal -v >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: fmt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xcrun metal -v >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check

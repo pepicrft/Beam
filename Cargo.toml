@@ -1,0 +1,38 @@
+[package]
+name = "beam"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A Rust-first launcher foundation with a cross-platform async file indexer."
+default-run = "beam-app"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5.51", features = ["derive", "env"] }
+directories = "6.0.0"
+futures = "0.3.31"
+globset = "0.4.18"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "700b0b5", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "700b0b5", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "700b0b5", package = "gpui_tokio" }
+ignore = "0.4.24"
+notify = "8.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tantivy = "0.22.1"
+tokio = { version = "1.48.0", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.17", features = ["codec"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[[bin]]
+name = "beam-app"
+path = "src/bin/beam-app.rs"
+
+[[bin]]
+name = "beam-indexer"
+path = "src/bin/beam-indexer.rs"
