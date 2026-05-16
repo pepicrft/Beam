@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-pub(crate) const INDEX_VERSION: &str = "beam-tantivy-v1";
+pub(crate) const INDEX_VERSION: &str = "beam-tantivy-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexPaths {

@@ -77,34 +77,19 @@ impl Default for IndexConfig {
                 "**/Library/CloudStorage/**/.file-revisions-by-id/**".to_string(),
                 "**/Library/CloudStorage/**/.tmp.drive*".to_string(),
                 "**/Library/CloudStorage/**/.tmp.drive*/**".to_string(),
-                "**/*.app/**".to_string(),
-                "**/*.appex/**".to_string(),
                 "**/*.backupdb/**".to_string(),
-                "**/*.bundle/**".to_string(),
                 "**/*.dSYM/**".to_string(),
                 "**/*.flplugin/**".to_string(),
-                "**/*.framework/**".to_string(),
                 "**/*.icdplugin/**".to_string(),
                 "**/*.ideplugin/**".to_string(),
-                "**/*.key/**".to_string(),
                 "**/*.lproj/**".to_string(),
                 "**/*.lrcat/**".to_string(),
                 "**/*.lrcat-data/**".to_string(),
                 "**/*.lrdata/**".to_string(),
                 "**/*.lrlibrary/**".to_string(),
                 "**/*.menu/**".to_string(),
-                "**/*.pkg/**".to_string(),
                 "**/*.playground/**".to_string(),
-                "**/*.plugin/**".to_string(),
-                "**/*.prefPane/**".to_string(),
                 "**/*.pvm/**".to_string(),
-                "**/*.xcodeproj/**".to_string(),
-                "**/*.xcworkspace/**".to_string(),
-                "**/*.xcassets/**".to_string(),
-                "**/*.pages/**".to_string(),
-                "**/*.numbers/**".to_string(),
-                "**/*.photoslibrary/**".to_string(),
-                "**/*.musiclibrary/**".to_string(),
             ],
             ignore_hidden: true,
             follow_symlinks: false,
@@ -158,6 +143,30 @@ pub enum EntryKind {
     Symlink,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryContentType {
+    Application,
+    Archive,
+    Audio,
+    Code,
+    Configuration,
+    Directory,
+    Document,
+    Image,
+    Other,
+    Package,
+    Shortcut,
+    Symlink,
+    Video,
+}
+
+impl EntryContentType {
+    pub fn is_launchable(self) -> bool {
+        matches!(self, Self::Application | Self::Shortcut)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexedEntry {
     pub root: PathBuf,
@@ -166,8 +175,10 @@ pub struct IndexedEntry {
     pub file_name: String,
     pub extension: Option<String>,
     pub kind: EntryKind,
+    pub content_type: EntryContentType,
     pub size_bytes: u64,
     pub modified_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<DateTime<Utc>>,
     pub is_hidden: bool,
 }
 

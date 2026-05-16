@@ -1,4 +1,4 @@
-use crate::indexer::types::{EntryKind, IndexConfig, IndexedEntry};
+use crate::indexer::types::{EntryContentType, EntryKind, IndexConfig, IndexedEntry};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -12,6 +12,44 @@ use std::{
 use tokio::{fs, task::JoinSet};
 
 const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".beamignore"];
+const APPLICATION_DIRECTORY_EXTENSIONS: &[&str] = &["app"];
+const PACKAGE_DIRECTORY_EXTENSIONS: &[&str] = &[
+    "appex",
+    "bundle",
+    "framework",
+    "key",
+    "numbers",
+    "pages",
+    "photoslibrary",
+    "musiclibrary",
+    "pkg",
+    "plugin",
+    "prefpane",
+    "xcodeproj",
+    "xcworkspace",
+    "xcassets",
+];
+const APPLICATION_FILE_EXTENSIONS: &[&str] = &["appimage", "bat", "cmd", "com", "exe", "msi"];
+const SHORTCUT_FILE_EXTENSIONS: &[&str] = &["appref-ms", "desktop", "lnk", "url", "webloc"];
+const ARCHIVE_FILE_EXTENSIONS: &[&str] = &["7z", "bz2", "gz", "rar", "tar", "xz", "zip", "zst"];
+const AUDIO_FILE_EXTENSIONS: &[&str] = &["aac", "aiff", "flac", "m4a", "mp3", "ogg", "wav"];
+const CODE_FILE_EXTENSIONS: &[&str] = &[
+    "c", "cc", "cpp", "cs", "css", "go", "h", "hpp", "html", "java", "js", "json", "jsx", "kt",
+    "lua", "md", "php", "py", "rb", "rs", "scss", "sh", "sql", "swift", "toml", "ts", "tsx", "xml",
+    "yaml", "yml",
+];
+const CONFIGURATION_FILE_EXTENSIONS: &[&str] = &[
+    "conf", "cfg", "env", "ini", "json", "plist", "toml", "yaml", "yml",
+];
+const DOCUMENT_FILE_EXTENSIONS: &[&str] = &[
+    "csv", "doc", "docx", "md", "odt", "pdf", "ppt", "pptx", "rtf", "txt", "xls", "xlsx",
+];
+const IMAGE_FILE_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "gif", "heic", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp",
+];
+const VIDEO_FILE_EXTENSIONS: &[&str] = &[
+    "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScannedDocument {
@@ -63,11 +101,11 @@ pub(crate) async fn scan_targets(
         )
         .await?
         {
-            let is_directory = document.entry.kind == EntryKind::Directory;
+            let should_descend = should_descend_into_entry(&document.entry);
             let document_path = document.entry.absolute_path.clone();
             outcome.documents.insert(document_path, document);
 
-            if is_directory {
+            if should_descend {
                 let subtree = scan_directory_subtree(
                     config.clone(),
                     target.root,
@@ -190,8 +228,9 @@ async fn scan_directory(
         }
 
         let document = build_scanned_document(config, &job.root, &path, &metadata).await?;
-        let should_descend =
-            metadata.is_dir() && (config.follow_symlinks || !metadata.file_type().is_symlink());
+        let should_descend = metadata.is_dir()
+            && !is_package_directory(&path)
+            && (config.follow_symlinks || !metadata.file_type().is_symlink());
         let document_path = document.entry.absolute_path.clone();
 
         documents.insert(document_path, document);
@@ -260,6 +299,7 @@ fn build_indexed_entry(root: &Path, path: &Path, metadata: &Metadata) -> Result<
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+    let last_accessed_at = metadata.accessed().ok().map(DateTime::<Utc>::from);
     let kind = if metadata.file_type().is_symlink() {
         EntryKind::Symlink
     } else if metadata.is_dir() {
@@ -270,6 +310,7 @@ fn build_indexed_entry(root: &Path, path: &Path, metadata: &Metadata) -> Result<
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy().to_string());
+    let content_type = classify_content_type(path, metadata, kind);
 
     Ok(IndexedEntry {
         root: root.to_path_buf(),
@@ -278,8 +319,10 @@ fn build_indexed_entry(root: &Path, path: &Path, metadata: &Metadata) -> Result<
         file_name,
         extension,
         kind,
+        content_type,
         size_bytes: metadata.len(),
         modified_at,
+        last_accessed_at,
         is_hidden: is_hidden(path, metadata),
     })
 }
@@ -453,6 +496,78 @@ fn is_text_candidate(path: &Path) -> bool {
     )
 }
 
+fn should_descend_into_entry(entry: &IndexedEntry) -> bool {
+    entry.kind == EntryKind::Directory
+        && !matches!(
+            entry.content_type,
+            EntryContentType::Application | EntryContentType::Package
+        )
+}
+
+fn classify_content_type(path: &Path, metadata: &Metadata, kind: EntryKind) -> EntryContentType {
+    if kind == EntryKind::Symlink {
+        return EntryContentType::Symlink;
+    }
+
+    let extension = lower_extension(path);
+    let extension = extension.as_deref();
+    if kind == EntryKind::Directory {
+        if extension.is_some_and(|extension| APPLICATION_DIRECTORY_EXTENSIONS.contains(&extension))
+        {
+            return EntryContentType::Application;
+        }
+        if extension.is_some_and(|extension| PACKAGE_DIRECTORY_EXTENSIONS.contains(&extension)) {
+            return EntryContentType::Package;
+        }
+        return EntryContentType::Directory;
+    }
+
+    if extension.is_some_and(|extension| APPLICATION_FILE_EXTENSIONS.contains(&extension))
+        || is_unix_executable(metadata)
+    {
+        return EntryContentType::Application;
+    }
+    if extension.is_some_and(|extension| SHORTCUT_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Shortcut;
+    }
+    if extension.is_some_and(|extension| ARCHIVE_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Archive;
+    }
+    if extension.is_some_and(|extension| AUDIO_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Audio;
+    }
+    if extension.is_some_and(|extension| CODE_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Code;
+    }
+    if extension.is_some_and(|extension| CONFIGURATION_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Configuration;
+    }
+    if extension.is_some_and(|extension| DOCUMENT_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Document;
+    }
+    if extension.is_some_and(|extension| IMAGE_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Image;
+    }
+    if extension.is_some_and(|extension| VIDEO_FILE_EXTENSIONS.contains(&extension)) {
+        return EntryContentType::Video;
+    }
+
+    EntryContentType::Other
+}
+
+fn is_package_directory(path: &Path) -> bool {
+    let Some(extension) = lower_extension(path) else {
+        return false;
+    };
+    APPLICATION_DIRECTORY_EXTENSIONS.contains(&extension.as_str())
+        || PACKAGE_DIRECTORY_EXTENSIONS.contains(&extension.as_str())
+}
+
+fn lower_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+}
+
 fn is_hidden(path: &Path, metadata: &Metadata) -> bool {
     path.file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with('.'))
@@ -472,6 +587,18 @@ fn windows_hidden(_metadata: &Metadata) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn is_unix_executable(metadata: &Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_unix_executable(_metadata: &Metadata) -> bool {
+    false
+}
+
 fn should_skip_io_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -484,7 +611,7 @@ fn should_skip_io_error(error: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ScanTarget, scan_full, scan_targets};
-    use crate::indexer::{IndexConfig, IndexStorageConfig};
+    use crate::indexer::{EntryContentType, IndexConfig, IndexStorageConfig};
     use anyhow::Result;
     use tempfile::tempdir;
     use tokio::fs;
@@ -590,6 +717,55 @@ mod tests {
             !outcome
                 .documents
                 .contains_key(&root.join("Editor.xcodeproj/project.pbxproj"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn app_bundle_root_is_indexed_without_descending_into_contents() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("Applications");
+        fs::create_dir_all(root.join("Beam.app/Contents/MacOS")).await?;
+        fs::write(root.join("Beam.app/Contents/MacOS/beam"), "binary").await?;
+
+        let outcome = scan_full(&test_config(&root)).await?;
+        let bundle_root = root.join("Beam.app");
+        let executable = root.join("Beam.app/Contents/MacOS/beam");
+
+        let bundle_entry = outcome
+            .documents
+            .get(&bundle_root)
+            .expect("bundle root should be indexed");
+        assert_eq!(
+            bundle_entry.entry.content_type,
+            EntryContentType::Application
+        );
+        assert!(!outcome.documents.contains_key(&executable));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scanner_classifies_launchable_files() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        fs::write(root.join("Beam.exe"), "binary").await?;
+        fs::write(root.join("Beam.desktop"), "[Desktop Entry]").await?;
+
+        let outcome = scan_full(&test_config(root)).await?;
+
+        assert_eq!(
+            outcome
+                .documents
+                .get(&root.join("Beam.exe"))
+                .map(|document| document.entry.content_type),
+            Some(EntryContentType::Application)
+        );
+        assert_eq!(
+            outcome
+                .documents
+                .get(&root.join("Beam.desktop"))
+                .map(|document| document.entry.content_type),
+            Some(EntryContentType::Shortcut)
         );
         Ok(())
     }
